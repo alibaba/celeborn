@@ -30,12 +30,14 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.util.internal.PlatformDependent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.metrics.source.AbstractSource;
+import org.apache.celeborn.common.network.util.NettyUtils;
 import org.apache.celeborn.common.protocol.TransportModuleConstants;
 import org.apache.celeborn.common.util.ThreadUtils;
 import org.apache.celeborn.common.util.Utils;
@@ -50,7 +52,8 @@ public class MemoryManager {
   @VisibleForTesting public long maxDirectMemory;
   private final long pausePushDataThreshold;
   private final long pauseReplicateThreshold;
-  private final double resumeRatio;
+  private final double directMemoryResumeRatio;
+  private final double pinnedMemoryResumeRatio;
   private final long maxSortMemory;
   private final int forceAppendPauseSpentTimeThreshold;
   private final List<MemoryPressureListener> memoryPressureListeners = new ArrayList<>();
@@ -60,6 +63,9 @@ public class MemoryManager {
 
   private final ScheduledExecutorService reportService =
       ThreadUtils.newDaemonSingleThreadScheduledExecutor("worker-memory-manager-reporter");
+
+  private final ScheduledExecutorService pinnedMemoryCheckService =
+      ThreadUtils.newDaemonSingleThreadScheduledExecutor("worker-pinned-memory-manager-checker");
 
   private final ExecutorService actionService =
       ThreadUtils.newDaemonSingleThreadExecutor("worker-memory-manager-actor");
@@ -120,11 +126,13 @@ public class MemoryManager {
   private MemoryManager(CelebornConf conf, StorageManager storageManager, AbstractSource source) {
     double pausePushDataRatio = conf.workerDirectMemoryRatioToPauseReceive();
     double pauseReplicateRatio = conf.workerDirectMemoryRatioToPauseReplicate();
-    this.resumeRatio = conf.workerDirectMemoryRatioToResume();
+    this.directMemoryResumeRatio = conf.workerDirectMemoryRatioToResume();
+    this.pinnedMemoryResumeRatio = conf.workerPinnedMemoryRatioToResume();
     double maxSortMemRatio = conf.workerPartitionSorterDirectMemoryRatioThreshold();
     double readBufferRatio = conf.workerDirectMemoryRatioForReadBuffer();
     double memoryFileStorageRatio = conf.workerDirectMemoryRatioForMemoryFilesStorage();
     long checkInterval = conf.workerDirectMemoryPressureCheckIntervalMs();
+    long pinnedMemoryCheckInterval = conf.workerPinnedMemoryCheckIntervalMs();
     long reportInterval = conf.workerDirectMemoryReportIntervalSecond();
     double readBufferTargetRatio = conf.readBufferTargetRatio();
     long readBufferTargetUpdateInterval = conf.readBufferTargetUpdateInterval();
@@ -148,9 +156,10 @@ public class MemoryManager {
             pauseReplicateRatio,
             CelebornConf.WORKER_DIRECT_MEMORY_RATIO_PAUSE_RECEIVE().key(),
             pausePushDataRatio));
-    Preconditions.checkArgument(pausePushDataRatio > resumeRatio);
+    Preconditions.checkArgument(pausePushDataRatio > directMemoryResumeRatio);
     if (memoryFileStorageRatio > 0) {
-      Preconditions.checkArgument(resumeRatio > (readBufferRatio + memoryFileStorageRatio));
+      Preconditions.checkArgument(
+          directMemoryResumeRatio > (readBufferRatio + memoryFileStorageRatio));
     }
 
     maxSortMemory = ((long) (maxDirectMemory * maxSortMemRatio));
@@ -189,6 +198,20 @@ public class MemoryManager {
         reportInterval,
         reportInterval,
         TimeUnit.SECONDS);
+
+    if (conf.networkMemoryAllocatorPooled()) {
+      pinnedMemoryCheckService.scheduleWithFixedDelay(
+          () -> {
+            try {
+              checkPinnedMemory();
+            } catch (Exception e) {
+              logger.error("Pinned memory tracker check error", e);
+            }
+          },
+          pinnedMemoryCheckInterval,
+          pinnedMemoryCheckInterval,
+          TimeUnit.MILLISECONDS);
+    }
 
     if (readBufferThreshold > 0) {
       // if read buffer threshold is zero means that there will be no map data partitions
@@ -282,7 +305,7 @@ public class MemoryManager {
         Utils.bytesToString(readBufferThreshold),
         Utils.bytesToString(readBufferTarget),
         Utils.bytesToString(memoryFileStorageThreshold),
-        resumeRatio);
+        directMemoryResumeRatio);
   }
 
   public boolean shouldEvict(boolean aggressiveMemoryFileEvictEnabled, double evictRatio) {
@@ -305,7 +328,7 @@ public class MemoryManager {
       return ServingState.PUSH_PAUSED;
     }
     // trigger resume
-    if (memoryUsage / (double) (maxDirectMemory) < resumeRatio) {
+    if (memoryUsage / (double) (maxDirectMemory) < directMemoryResumeRatio) {
       isPaused = false;
       return ServingState.NONE_PAUSED;
     }
@@ -338,9 +361,7 @@ public class MemoryManager {
         pausePushDataCounter.increment();
         if (lastState == ServingState.PUSH_AND_REPLICATE_PAUSED) {
           logger.info("Trigger action: RESUME REPLICATE");
-          memoryPressureListeners.forEach(
-              memoryPressureListener ->
-                  memoryPressureListener.onResume(TransportModuleConstants.REPLICATE_MODULE));
+          resumeReplicate();
         } else if (lastState == ServingState.NONE_PAUSED) {
           logger.info("Trigger action: PAUSE PUSH");
           pausePushDataStartTime = System.currentTimeMillis();
@@ -369,15 +390,9 @@ public class MemoryManager {
         // resume from paused mode, append pause spent time
         appendPauseSpentTime(lastState);
         if (lastState == ServingState.PUSH_AND_REPLICATE_PAUSED) {
-          logger.info("Trigger action: RESUME REPLICATE");
-          memoryPressureListeners.forEach(
-              memoryPressureListener ->
-                  memoryPressureListener.onResume(TransportModuleConstants.REPLICATE_MODULE));
+          resumeReplicate();
         }
-        logger.info("Trigger action: RESUME PUSH");
-        memoryPressureListeners.forEach(
-            memoryPressureListener ->
-                memoryPressureListener.onResume(TransportModuleConstants.PUSH_MODULE));
+        resumePush();
     }
   }
 
@@ -434,6 +449,16 @@ public class MemoryManager {
 
   public long getMemoryUsage() {
     return getNettyUsedDirectMemory() + sortMemoryCounter.get();
+  }
+
+  public long getAllocatedMemory() {
+    return getNettyPinnedDirectMemory() + sortMemoryCounter.get();
+  }
+
+  public long getNettyPinnedDirectMemory() {
+    return NettyUtils.getAllPooledByteBufAllocators().stream()
+        .mapToLong(PooledByteBufAllocator::pinnedDirectMemory)
+        .sum();
   }
 
   public AtomicLong getSortMemoryCounter() {
@@ -541,6 +566,7 @@ public class MemoryManager {
   public void close() {
     checkService.shutdown();
     reportService.shutdown();
+    pinnedMemoryCheckService.shutdown();
     readBufferTargetUpdateService.shutdown();
     memoryPressureListeners.clear();
     actionService.shutdown();
@@ -555,6 +581,37 @@ public class MemoryManager {
   @VisibleForTesting
   public static void reset() {
     _INSTANCE = null;
+  }
+
+  private void checkPinnedMemory() {
+    // CELEBORN-1792: resume should use pinnedDirectMemory instead of usedDirectMemory
+    if (getAllocatedMemory() / (double) (maxDirectMemory) < pinnedMemoryResumeRatio) {
+      switch (servingState) {
+        case PUSH_AND_REPLICATE_PAUSED:
+          trimAllListeners();
+          resumeReplicate();
+          resumePush();
+          break;
+        case PUSH_PAUSED:
+          trimAllListeners();
+          resumePush();
+          break;
+      }
+    }
+  }
+
+  private void resumePush() {
+    logger.info("Trigger action: RESUME PUSH");
+    memoryPressureListeners.forEach(
+        memoryPressureListener ->
+            memoryPressureListener.onResume(TransportModuleConstants.PUSH_MODULE));
+  }
+
+  private void resumeReplicate() {
+    logger.info("Trigger action: RESUME REPLICATE");
+    memoryPressureListeners.forEach(
+        memoryPressureListener ->
+            memoryPressureListener.onResume(TransportModuleConstants.REPLICATE_MODULE));
   }
 
   public interface MemoryPressureListener {
